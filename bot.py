@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from news_policy import classify, render_brief, MAX_NEWS_AGE_SECONDS, is_duplicate, remember_alert
 
 ROOT = Path(__file__).resolve().parent
 UTC = dt.timezone.utc
@@ -243,52 +244,20 @@ def fetch(feed: Feed) -> list[dict]:
 
 
 def news_topic(item: dict) -> tuple[str, str] | None:
-    body = (item['title'] + ' ' + item['summary']).casefold()
-    if re.search(r'\b(trading guide|technical analysis|price forecast|how to trade)\b', body):
-        return None
-    if re.search(r'\b(gold|bullion|xauusd|xau/usd)\b', body):
-        return ('خبر متعلق بالذهب', 'يتناول العنوان الذهب مباشرة. اقرأ المصدر لمعرفة التفاصيل والسياق.')
-    us = re.search(r'\b(fed|fomc|federal reserve|u\.?s\.?|american|treasury|treasuries|dollar|powell)\b', body)
-    macro = re.search(r'\b(inflation|cpi|pce|payrolls|jobs|unemployment|interest rates?|rate cuts?|rate hikes?|yields?|monetary|tariffs?)\b', body)
-    if us and macro:
-        return ('خبر عن الفائدة أو الاقتصاد الأمريكي', 'قد يؤثر الخبر في توقعات الفائدة أو الدولار، ومن ثم في الذهب. لم تُحدد جهة حركة السعر.')
-    geopolitical = re.search(r'\b(geopolitical|ceasefire|military strikes?|missile|strait of hormuz|nuclear threats?|war escalat\w*|sanctions?)\b', body)
-    regional_crisis = re.search(r'\b(strikes?|evacuat\w*|war)\b', body) and re.search(r'\b(iran|israel|middle east|hormuz|russia|ukraine)\b', body)
-    if geopolitical or regional_crisis:
-        return ('تطور جيوسياسي محتمل الأهمية', 'قد يغير التطور الطلب على الملاذات الآمنة أو توقعات التضخم. أثره على الذهب يعتمد على السياق.')
-    return None
+    info = classify('news', item)
+    return (info['title'], info['reason']) if info else None
 
 
 def relevant(feed: Feed, item: dict) -> bool:
-    if feed.kind in ('news', 'ff-news', 'ls-news'):
-        return news_topic(item) is not None
-    body = (item["title"] + " " + item["summary"]).casefold()
-    return not feed.keywords or any(word in body for word in feed.keywords)
+    return classify(feed.key, item) is not None
 
 
 def format_alert(feed: Feed, item: dict, now: dt.datetime | None = None) -> str:
     now = now or dt.datetime.now(UTC)
     published = timestamp(item["published"])
-    when = published.strftime("%Y-%m-%d %H:%M UTC") if published else "غير متاح في المصدر"
-    is_news = feed.kind in ('news', 'ff-news', 'ls-news')
-    topic = news_topic(item) if is_news else None
-    category, reason = topic or (feed.category, feed.reason)
-    source = feed.source
-    if item.get('attribution'):
-        source += ' — ينقل عن: ' + item['attribution']
-    header = '🔔 <b>عنوان إخباري قد يؤثر في الذهب</b>\n\n' if is_news else '🔔 <b>خبر رسمي قد يؤثر في الذهب</b>\n\n'
-    return (
-        header
-        + f"<b>{html.escape(category)}</b>\n"
-        f"المصدر: {html.escape(source)}\n"
-        f"وقت النشر: {when}\n"
-        f"وقت الرصد: {now.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        f"<b>سبب المتابعة:</b> {html.escape(reason)}\n\n"
-        f"<b>العنوان الأصلي بلغة المصدر:</b>\n{html.escape(item['title'][:700])}\n\n"
-        f"<a href=\"{html.escape(item['link'], quote=True)}\">قراءة الخبر من المصدر</a>\n\n"
-        "هذا تنبيه إلى نشر أو تحديث خبر؛ ليس إشارة شراء أو بيع. "
-        "لم تُقارن الأرقام بتوقعات السوق، ولم يُحدد اتجاه حركة الذهب."
-    )
+    if published is None:
+        raise ValueError('A verified source timestamp is required')
+    return render_brief(feed, item, published, now)
 
 
 class TelegramError(Exception):
@@ -330,6 +299,7 @@ def database(path=ROOT / "state.sqlite3"):
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY)")
     db.execute("CREATE TABLE IF NOT EXISTS seeded (feed TEXT PRIMARY KEY)")
+    db.execute('CREATE TABLE IF NOT EXISTS event_alert_history (sent REAL, tokens TEXT, numbers TEXT)')
     return db
 
 
@@ -341,9 +311,10 @@ def process_feed(db, feed, items, send, now=None):
         if db.execute("SELECT 1 FROM seen WHERE id=?", (item["id"],)).fetchone():
             continue
         published = timestamp(item["published"])
-        fresh = published is not None and -300 <= (now - published).total_seconds() <= 21600
-        if not seed and fresh and relevant(feed, item):
+        fresh = published is not None and -60 <= (now - published).total_seconds() <= MAX_NEWS_AGE_SECONDS
+        if not seed and fresh and relevant(feed, item) and not is_duplicate(db, item, now):
             send(format_alert(feed, item, now))
+            remember_alert(db, item, now)
             sent += 1
         # Persist after delivery. Failed deliveries remain eligible for retry.
         db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (item["id"],))
@@ -436,8 +407,11 @@ def main():
     parser.add_argument("--check-feeds", action="store_true")
     args = parser.parse_args()
     if args.demo:
-        print(format_alert(FEEDS[2], dict(title="Consumer Price Index — EXAMPLE ONLY",
-                                        link="https://www.bls.gov/cpi/", published="")))
+        print('🧪 مثال توضيحي بأرقام افتراضية — ليس خبرًا حيًا\n')
+        now = dt.datetime.now(UTC)
+        print(format_alert(FEEDS[2], dict(title="US CPI (M/M): 0.4% (est 0.2%; prev 0.1%) — EXAMPLE ONLY",
+                                        summary='', link="https://www.bls.gov/cpi/",
+                                        published=(now - dt.timedelta(minutes=3)).isoformat()), now))
         return
     if args.check_feeds:
         from concurrent.futures import ThreadPoolExecutor
