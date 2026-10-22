@@ -3,9 +3,11 @@ import datetime as dt
 import hashlib
 import html
 import json
+import re
 import urllib.request
 
 from bot import UTC, timestamp
+from news_policy import format_time
 
 CALENDAR_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
 
@@ -48,19 +50,41 @@ def cached_calendar(db, now, downloader=download_calendar):
         raise
 
 
-def format_event(row, event_time, now):
+def event_name(title):
+    title = re.sub(r'^us\s+', '', str(title).strip(), flags=re.I)
+    patterns = [
+        (r'^(?:core )?cpi(?: (?:m/m|y/y))?$', 'التضخم CPI'),
+        (r'^(?:core )?pce price index(?: (?:m/m|y/y))?$', 'التضخم المفضل للفيدرالي PCE'),
+        (r'^(?:core )?ppi(?: (?:m/m|y/y))?$', 'أسعار المنتجين PPI'),
+        (r'^non[- ]?farm (?:employment change|payrolls)$', 'الوظائف غير الزراعية NFP'),
+        (r'^unemployment rate$', 'معدل البطالة'),
+        (r'^average hourly earnings(?: (?:m/m|y/y))?$', 'متوسط الأجور'),
+        (r'^(?:federal funds rate|fomc statement|fomc press conference)$', 'قرار أو مؤتمر الفيدرالي'),
+    ]
+    for pattern, label in patterns:
+        if re.search(pattern, title, re.I):
+            return label
+    return None
+
+
+def format_event(rows, event_time, now):
+    if isinstance(rows, dict):
+        rows = [rows]
     minutes = max(1, int((event_time - now).total_seconds() / 60))
-    forecast = html.escape(str(row.get('forecast') or 'غير متاح'))
-    previous = html.escape(str(row.get('previous') or 'غير متاح'))
-    return ('📅 <b>تذكير بموعد خبر أمريكي عالي التأثير</b>\n\n'
-            f"الحدث بلغة المصدر: {html.escape(str(row['title'])[:400])}\n"
-            'العملة: USD — التصنيف في تقويم Forex Factory: تأثير مرتفع\n'
-            f"الموعد: {event_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
-            f'باقٍ نحو {minutes} دقيقة عند الرصد\n'
-            f'التوقع: {forecast}\nالسابق: {previous}\n\n'
-            'قد يؤثر الحدث في توقعات الفائدة والدولار والذهب. هذا تذكير بالموعد؛ '
-            'لا يتضمن النتيجة الفعلية ولا يحدد اتجاه حركة السعر.\n'
-            '<a href="https://www.forexfactory.com/calendar">التحقق من الموعد في التقويم</a>')
+    details = []
+    for row in rows[:6]:
+        forecast = html.escape(str(row.get('forecast') or 'غير متاح'))
+        previous = html.escape(str(row.get('previous') or 'غير متاح'))
+        details.append(f"• {html.escape(event_name(row['title']) or row['title'])} ({html.escape(row['title'])})\n"
+                       f'المتوقع: {forecast} | السابق: {previous}')
+    return ('📅 <b>XAU/USD | موعد اقتصادي حساس</b>\n'
+            f"الموعد: {format_time(event_time)} — بعد نحو {minutes} دقيقة\n"
+            'USD | تأثير مرتفع حسب Forex Factory\n\n' + '\n'.join(details)
+            + '\nالتوقعات من تصدير مخزّن؛ قد يتأخر تحديثها.\n\nما يهم عند الصدور: الفعلي مقابل المتوقع، وتوافق تفاصيل الإصدار. '
+            'لا تكفي قراءة رقم واحد إن تعارضت معه الأجور أو البطالة أو التضخم الأساسي.\n'
+            'تأكيد السوق: حركة الدولار والعوائد والذهب والسبريد في منصتك؛ البوت لا يقيسها.\n'
+            'هذا تذكير؛ لا يتضمن النتيجة الفعلية ولا إشارة دخول.\n'
+            '<a href="https://www.forexfactory.com/calendar">فتح تقويم المصدر</a>')
 
 
 def check_calendar(db, send, now=None, downloader=download_calendar):
@@ -68,16 +92,20 @@ def check_calendar(db, send, now=None, downloader=download_calendar):
     rows = cached_calendar(db, now, downloader)
     db.execute('CREATE TABLE IF NOT EXISTS calendar_sent (id TEXT PRIMARY KEY)')
     sent = 0
+    grouped = {}
     for row in rows:
         if str(row.get('country', '')).upper() != 'USD' or str(row.get('impact', '')).lower() != 'high':
             continue
         date = timestamp(row.get('date', ''))
-        if not date or not row.get('title') or not 0 < (date - now).total_seconds() <= 1800:
+        if not date or not event_name(row.get('title', '')) or not 0 < (date - now).total_seconds() <= 900:
             continue
-        key = hashlib.sha256(json.dumps([row['title'], 'USD', date.isoformat()]).encode()).hexdigest()
+        grouped.setdefault(date, []).append(row)
+    for date, rows_at_time in sorted(grouped.items()):
+        # One reminder for simultaneous CPI / core CPI, or payroll / wages / unemployment.
+        key = 'strict-v2-' + hashlib.sha256(('USD:' + date.isoformat()).encode()).hexdigest()
         if db.execute('SELECT 1 FROM calendar_sent WHERE id=?', (key,)).fetchone():
             continue
-        send(format_event(row, date, now))
+        send(format_event(rows_at_time, date, now))
         db.execute('INSERT INTO calendar_sent VALUES (?)', (key,))
         db.commit()
         sent += 1
