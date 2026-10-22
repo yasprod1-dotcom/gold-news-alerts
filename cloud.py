@@ -6,6 +6,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 from bot import FEEDS, Telegram, TelegramError, database, fetch, process_feed
+from event_alerts import check_calendar
 
 
 def configuration(env):
@@ -22,8 +23,8 @@ def configuration(env):
     return token, chat_id
 
 
-def run_once(tg, chat_id, db, fetcher=fetch):
-    """Cached database contains public news hashes only, never owner IDs or tokens."""
+def run_once(tg, chat_id, db, fetcher=fetch, calendar_checker=check_calendar):
+    """Cache contains public news/calendar state, never owner IDs or tokens."""
     chat = tg.call('getChat', chat_id=chat_id)
     if chat.get('type') != 'private' or chat.get('id') != chat_id:
         raise TelegramError('استخدم معرف محادثة شخصية مع البوت.')
@@ -39,10 +40,19 @@ def run_once(tg, chat_id, db, fetcher=fetch):
             errors += 1
             # Only a source ID is logged; exception strings may contain credentials.
             print(f'{feed.key}: check or delivery failed; next run will retry')
+    try:
+        reminders = calendar_checker(db, lambda message: tg.send(chat_id, message))
+        total += reminders
+        print(f'forexfactory-calendar: {reminders} reminders')
+    except (OSError, ValueError, TelegramError):
+        errors += 1
+        print('forexfactory-calendar: check or delivery failed; next run will retry')
     if errors == 0 and not db.execute("SELECT 1 FROM cloud_meta WHERE key='started'").fetchone():
         tg.send(chat_id, '✅ تم تفعيل فحص أخبار الذهب عبر GitHub.\n'
                 'تصل التنبيهات إلى تلغرام على هاتفك والكمبيوتر مغلق.\n'
                 'الفحص مجدول كل خمس دقائق تقريبًا، وقد يتأخر تشغيل GitHub أو نشر الخلاصات.\n'
+                'المصادر: الفيدرالي وBLS وBloomberg وForex Factory وFXStreet ومختارات LiveSquawk العامة.\n'
+                'تذكيرات التقويم تخص أخبار USD عالية التأثير قبل موعدها بنحو نصف ساعة.\n'
                 'سُجلت الأخبار الحالية دون إرسالها؛ ستصلك الإصدارات الجديدة.\n'
                 'إذا أُعيد تهيئة سجل الأخبار، قد تصلك رسالة التفعيل هذه مرة أخرى.')
         db.execute("INSERT INTO cloud_meta VALUES ('started')")

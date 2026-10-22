@@ -1,0 +1,10 @@
+{
+  "automatic_x_monitoring_enabled": false,
+  "reason": "Official X API reading incurs costs; user requested free operation.",
+  "accounts": ["LiveSquawk", "FXStreetNews", "ForexFactory"],
+  "free_source_coverage": {
+    "FXStreetNews": "FXStreet public website RSS, not the X account timeline",
+    "ForexFactory": "Forex Factory public news page and calendar, not the X account timeline",
+    "LiveSquawk": "LiveSquawk public Newsfeed Highlights only, not all headlines or X posts"
+  }
+}
